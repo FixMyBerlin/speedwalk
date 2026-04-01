@@ -33,7 +33,7 @@
     try {
       await OSM.login({
         mode: "popup",
-        clientId: "vyCV0t-IiskqNBgpiHvuSAmf2nC8K-zfByeFL6XtAzc",
+        clientId: "T_ERWwLEqQZUWR8QuDbzAoVKcZ6X9VY8nOr2_NXw1r4",
         redirectUrl: `${window.location.origin}/speedwalk/land.html`,
         scopes: ["read_prefs", "write_api"],
       });
