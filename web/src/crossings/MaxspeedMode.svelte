@@ -87,7 +87,7 @@
   {#snippet left()}
     <Jumbotron
       title="Maxspeed"
-      lead="Enriches crossing ways with the maxspeed attribute of the crossed road."
+      lead="Enriches crossing ways with the maxspeed attribute of the crossed road. When a crossing spans more than one road, the highest speed limit among all crossed roads is used."
     >
       <p class="mb-0 small text-muted">
         {crossingsWithMaxspeed.toLocaleString()} of {crossings.features.length.toLocaleString()}
@@ -98,9 +98,6 @@
           {crossingsWithoutMaxspeed.toLocaleString()} crossings have no maxspeed because of missing data on road.
         </p>
       {/if}
-      <p class="mb-0 small text-muted">
-        When a crossing spans a dual carriageway or multiple roads, the highest speed limit among all crossed roads is used.
-      </p>
     </Jumbotron>
 
     <div class="mb-3">
