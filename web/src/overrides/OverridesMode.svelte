@@ -3,12 +3,22 @@
     getOverrides,
     saveOverrides,
     filterSegmentsInBoundary,
+    filterDeletionsInBoundary,
   } from "../common/localOverrides";
   import {
+    crossingStableId,
+    deletionStableId,
+    inViewIdSets,
+    type ViewportBounds,
+  } from "../common/viewportOverrides";
+  import {
     type AddedCrossingSegment,
+    type DeletedWaySegment,
     type ManualOverrides,
+    type ResolvedCrossingSegment,
     isValidSegment,
     manualOverridesSchema,
+    resolvedCrossingSegmentSchema,
     snappedSegmentSchema,
   } from "../common/overridesSchema";
   import {
@@ -34,31 +44,58 @@
   import FilterNetworkCard from "../common/FilterNetworkCard.svelte";
   import LegendList from "../common/LegendList.svelte";
   import { downloadGeneratedFile, Loading } from "svelte-utils";
-  import type { FeatureCollection, Point } from "geojson";
+  import type { FeatureCollection, LineString, Point } from "geojson";
   import { type NodeProps } from "../sidewalks";
   import { roadLineWidth } from "../sidewalks";
   import { MAPILLARY_PIN_LAYER_IDS_LIST } from "../common/mapillaryLayers";
-
-  const overridesLegendItems = [
-    { label: "Base data", color: "black", swatchClass: "rectangle" as const },
-    {
-      label: "Manually added",
-      color: "blue",
-      swatchClass: "rectangle" as const,
-    },
-  ];
+  import { overridesLegendColors, overridesLegendItems } from "./legend";
 
   /** First click: red dot (start of crossing segment). Second click: blue dot (end). */
   let pointA: { lng: number; lat: number } | null = $state(null);
   let pointB: { lng: number; lat: number } | null = $state(null);
   let loading = $state("");
   let applyError = $state("");
-  let overrides: ManualOverrides = $state({ version: 1, addedCrossings: [] });
-  let overridesApplied = $state(true);
-  let appliedCount = $state(0);
+  let overrides: ManualOverrides = $state({
+    version: 1,
+    addedCrossings: [],
+    deletedWaySegments: [],
+  });
+  // Stored overrides are loaded first; they are only applied when user clicks Apply.
+  let overridesApplied = $state(false);
+  /** Backend command stack: all crossings in order, then all manual deletions in order. */
+  let appliedCrossingCount = $state(0);
+  let appliedDeletionCount = $state(0);
   let nodes: FeatureCollection<Point, NodeProps> = $state.raw({
     type: "FeatureCollection",
     features: [],
+  });
+
+  /** Current map camera; updated on pan/zoom for in-view row indicators. */
+  let viewportBounds = $state<ViewportBounds | null>(null);
+
+  $effect(() => {
+    const mapInstance = $map;
+    if (!mapInstance) {
+      viewportBounds = null;
+      return;
+    }
+    const mapRef = mapInstance;
+    function syncViewport() {
+      const b = mapRef.getBounds();
+      viewportBounds = {
+        west: b.getWest(),
+        south: b.getSouth(),
+        east: b.getEast(),
+        north: b.getNorth(),
+      };
+    }
+    syncViewport();
+    mapRef.on("moveend", syncViewport);
+    mapRef.on("zoomend", syncViewport);
+    return () => {
+      mapRef.off("moveend", syncViewport);
+      mapRef.off("zoomend", syncViewport);
+    };
   });
 
   $effect(() => {
@@ -71,18 +108,15 @@
   });
 
   $effect(() => {
-    const b = $backend;
-    if (!b) {
-      appliedCount = 0;
+    if (!$backend) {
+      appliedCrossingCount = 0;
+      appliedDeletionCount = 0;
+      overridesApplied = false;
       return;
     }
     getOverrides().then((data) => {
       overrides = data;
-      const boundary = JSON.parse(b.getBoundary());
-      const list = filterSegmentsInBoundary(data.addedCrossings, boundary);
-      if (overridesApplied && list.length > 0 && appliedCount === 0) {
-        applyAll(list);
-      }
+      // Manual overrides intentionally stay unapplied on load.
     });
   });
 
@@ -91,6 +125,16 @@
     try {
       const boundary = JSON.parse($backend.getBoundary());
       return filterSegmentsInBoundary(overrides.addedCrossings, boundary);
+    } catch {
+      return [];
+    }
+  });
+
+  const deletionsInLoadedArea = $derived.by(() => {
+    if (!$backend) return [];
+    try {
+      const boundary = JSON.parse($backend.getBoundary());
+      return filterDeletionsInBoundary(overrides.deletedWaySegments, boundary);
     } catch {
       return [];
     }
@@ -131,50 +175,307 @@
     return { type: "FeatureCollection" as const, features };
   });
 
+  /** Draw snapped deletion draft line (pos1-pos2) as the primary visual. */
+  const deletedDraftLinesGeoJSON = $derived.by(() => {
+    const seen = new Set<string>();
+    const features = deletionsInLoadedArea.flatMap((seg) => {
+      if (!seg.draftStart || !seg.draftEnd) return [];
+      const key = draftKey(seg);
+      if (!key || seen.has(key)) return [];
+      seen.add(key);
+      return [
+        {
+          type: "Feature" as const,
+          geometry: {
+            type: "LineString" as const,
+            coordinates: [
+              [seg.draftStart.lng, seg.draftStart.lat],
+              [seg.draftEnd.lng, seg.draftEnd.lat],
+            ],
+          },
+          properties: {
+            kind: "draft",
+          },
+        },
+      ];
+    });
+    return {
+      type: "FeatureCollection" as const,
+      features,
+    } as FeatureCollection<LineString>;
+  });
+
+  /** Draw resolved deleted edge geometry as optional secondary visual. */
+  const deletedResolvedEdgesGeoJSON = $derived.by(() => {
+    const features = deletionsInLoadedArea.flatMap((seg) => {
+      if (
+        seg.node1Lat == null ||
+        seg.node1Lng == null ||
+        seg.node2Lat == null ||
+        seg.node2Lng == null
+      ) {
+        return [];
+      }
+      return [
+        {
+          type: "Feature" as const,
+          geometry: {
+            type: "LineString" as const,
+            coordinates: [
+              [seg.node1Lng, seg.node1Lat],
+              [seg.node2Lng, seg.node2Lat],
+            ],
+          },
+          properties: {
+            kind: "resolved",
+            wayId: seg.wayId,
+            node1: seg.node1,
+            node2: seg.node2,
+          },
+        },
+      ];
+    });
+    return {
+      type: "FeatureCollection" as const,
+      features,
+    } as FeatureCollection<LineString>;
+  });
+
   const crossingWayTags = {
     highway: "footway",
     footway: "crossing",
     crossing: "manual",
   };
 
-  async function applyAll(segments: AddedCrossingSegment[]) {
-    if (!$backend) return;
-    applyError = "";
-    loading = "Applying overrides";
-    await refreshLoadingScreen();
-    try {
-      for (const seg of segments) {
-        if (!isValidSegment(seg)) continue;
-        $backend.editAddCrossingSegment(
-          seg.start.lng,
-          seg.start.lat,
-          seg.end.lng,
-          seg.end.lat,
-          { ...crossingWayTags, ...seg.tags },
+  const APPLY_CHUNK_SIZE = 200;
+
+  function chunkArray<T>(items: T[], size: number): T[][] {
+    if (items.length === 0) return [];
+    const out: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
+
+  type BatchCrossingPayload = {
+    start: { lng: number; lat: number };
+    end: { lng: number; lat: number };
+    tags: Record<string, string>;
+    resolved?: ResolvedCrossingSegment;
+  };
+
+  type BatchDeletionPayload = {
+    wayId: number;
+    node1: number;
+    node2: number;
+  };
+
+  function toBatchCrossing(seg: AddedCrossingSegment): BatchCrossingPayload {
+    return {
+      start: seg.start,
+      end: seg.end,
+      tags: { ...crossingWayTags, ...seg.tags },
+      resolved: seg.resolved,
+    };
+  }
+
+  function deletionPayloadKey(p: BatchDeletionPayload): string {
+    return `${p.wayId}:${p.node1}:${p.node2}`;
+  }
+
+  function draftKey(seg: DeletedWaySegment): string | null {
+    if (!seg.draftStart || !seg.draftEnd) return null;
+    return [
+      seg.draftStart.lng.toFixed(7),
+      seg.draftStart.lat.toFixed(7),
+      seg.draftEnd.lng.toFixed(7),
+      seg.draftEnd.lat.toFixed(7),
+    ].join("|");
+  }
+
+  type BatchCapableBackend = {
+    editApplyManualOverridesBatch: (
+      crossings: BatchCrossingPayload[],
+      deletions: BatchDeletionPayload[],
+    ) => void;
+    editClearManualOverrides: () => void;
+  };
+
+  async function resolveDeletionPayloadsForApply(
+    deletions: DeletedWaySegment[],
+  ): Promise<BatchDeletionPayload[]> {
+    if (!$backend) return [];
+    const payloads: BatchDeletionPayload[] = [];
+    const seen = new Set<string>();
+    const drafts = new Map<string, { start: { lng: number; lat: number }; end: { lng: number; lat: number } }>();
+
+    for (const seg of deletions) {
+      const k = draftKey(seg);
+      if (k && seg.draftStart && seg.draftEnd) {
+        if (!drafts.has(k)) {
+          drafts.set(k, { start: seg.draftStart, end: seg.draftEnd });
+        }
+      } else {
+        console.warn(
+          "[Overrides] Skipping deletion without draftStart/draftEnd; remove and redraw it.",
+          seg,
         );
-        mutationCounter.update((n) => n + 1);
       }
-      appliedCount = segments.length;
+    }
+
+    for (const draft of drafts.values()) {
+      const raw = JSON.parse(
+        $backend.resolveManualDeletion(
+          draft.start.lng,
+          draft.start.lat,
+          draft.end.lng,
+          draft.end.lat,
+        ),
+      ) as ResolvedDeletionJson;
+      for (const e of raw.edges ?? []) {
+        const p = { wayId: e.way_id, node1: e.node1, node2: e.node2 };
+        const key = deletionPayloadKey(p);
+        if (!seen.has(key)) {
+          seen.add(key);
+          payloads.push(p);
+        }
+      }
+    }
+    return payloads;
+  }
+
+  function progressMessage(
+    phase: "crossings" | "deletions",
+    step: number,
+    totalSteps: number,
+    processed: number,
+    total: number,
+  ): string {
+    return `Applying ${phase}: step ${step} of ${totalSteps} (${processed}/${total})`;
+  }
+
+  async function applyChunk(
+    crossingsChunk: AddedCrossingSegment[],
+    deletionsChunk: BatchDeletionPayload[],
+  ): Promise<void> {
+    if (!$backend) return;
+    const batchBackend = $backend as unknown as BatchCapableBackend;
+    if (batchBackend.editApplyManualOverridesBatch) {
+      batchBackend.editApplyManualOverridesBatch(
+        crossingsChunk.map(toBatchCrossing),
+        deletionsChunk,
+      );
+      mutationCounter.update((n) => n + 1);
+      return;
+    }
+
+    // Fallback when running older wasm package without batch API.
+    for (const seg of crossingsChunk) {
+      if (!isValidSegment(seg)) continue;
+      $backend.editAddCrossingSegment(
+        seg.start.lng,
+        seg.start.lat,
+        seg.end.lng,
+        seg.end.lat,
+        { ...crossingWayTags, ...seg.tags },
+      );
+      mutationCounter.update((n) => n + 1);
+    }
+    for (const d of deletionsChunk) {
+      $backend.editManualDeleteEdge(BigInt(d.wayId), BigInt(d.node1), BigInt(d.node2));
+      mutationCounter.update((n) => n + 1);
+    }
+  }
+
+  /** Apply crossings first, then manual deletions (matches backend undo order). */
+  async function applyEverythingInBoundary(
+    crossings: AddedCrossingSegment[],
+    deletions: DeletedWaySegment[],
+    opts: { append?: boolean } = {},
+  ) {
+    if (!$backend) return;
+    const append = opts.append ?? false;
+    const baseCrossings = append ? appliedCrossingCount : 0;
+    const baseDeletions = append ? appliedDeletionCount : 0;
+    applyError = "";
+    const startTimeMs = performance.now();
+    try {
+      const deletionPayloads = await resolveDeletionPayloadsForApply(deletions);
+      const crossingChunks = chunkArray(crossings, APPLY_CHUNK_SIZE);
+      const deletionChunks = chunkArray(deletionPayloads, APPLY_CHUNK_SIZE);
+      const totalSteps = crossingChunks.length + deletionChunks.length;
+      const totalOps = crossings.length + deletionPayloads.length;
+      let processedCrossings = 0;
+      let processedDeletions = 0;
+      let step = 0;
+
+      for (const chunk of crossingChunks) {
+        step++;
+        const processedBeforeChunk = processedCrossings + processedDeletions;
+        loading = progressMessage(
+          "crossings",
+          step,
+          totalSteps,
+          processedBeforeChunk,
+          totalOps,
+        );
+        console.info("[Overrides]", loading);
+        await refreshLoadingScreen();
+        await applyChunk(chunk, []);
+        processedCrossings += chunk.length;
+        appliedCrossingCount = baseCrossings + processedCrossings;
+      }
+
+      for (const chunk of deletionChunks) {
+        step++;
+        const processedBeforeChunk = processedCrossings + processedDeletions;
+        loading = progressMessage(
+          "deletions",
+          step,
+          totalSteps,
+          processedBeforeChunk,
+          totalOps,
+        );
+        console.info("[Overrides]", loading);
+        await refreshLoadingScreen();
+        await applyChunk([], chunk);
+        processedDeletions += chunk.length;
+        appliedDeletionCount = baseDeletions + deletions.length;
+      }
+
+      const durationMs = Math.round(performance.now() - startTimeMs);
+      console.info(
+        `[Overrides] Applied ${processedCrossings} crossings and ${processedDeletions} deletion edges from ${deletions.length} stored deletions in ${durationMs}ms (${totalSteps} step${totalSteps === 1 ? "" : "s"})`,
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       applyError =
         msg ||
         "Failed to apply override (e.g. could not snap to road or sidewalk)";
+      console.error("[Overrides] applyEverythingInBoundary failed:", e);
     } finally {
+      overridesApplied = appliedCrossingCount > 0 || appliedDeletionCount > 0;
       loading = "";
     }
   }
 
   async function unapplyAll() {
-    if (!$backend || appliedCount === 0) return;
+    if (!$backend || (appliedCrossingCount === 0 && appliedDeletionCount === 0))
+      return;
     loading = "Unapplying overrides";
     await refreshLoadingScreen();
     try {
-      for (let i = 0; i < appliedCount; i++) {
+      for (let i = 0; i < appliedDeletionCount; i++) {
         $backend.editUndo();
         mutationCounter.update((n) => n + 1);
       }
-      appliedCount = 0;
+      for (let i = 0; i < appliedCrossingCount; i++) {
+        $backend.editUndo();
+        mutationCounter.update((n) => n + 1);
+      }
+      appliedDeletionCount = 0;
+      appliedCrossingCount = 0;
     } finally {
       loading = "";
     }
@@ -186,8 +487,11 @@
       await unapplyAll();
       overridesApplied = false;
     } else {
-      await applyAll(segmentsInLoadedArea);
-      overridesApplied = true;
+      await applyEverythingInBoundary(
+        segmentsInLoadedArea,
+        deletionsInLoadedArea,
+      );
+      overridesApplied = appliedCrossingCount > 0 || appliedDeletionCount > 0;
     }
   }
 
@@ -300,6 +604,7 @@
         return;
       }
       const { start, end } = parsed.data;
+      const resolvedParsed = resolvedCrossingSegmentSchema.safeParse(rawSnapped);
       $backend.editAddCrossingSegment(
         start.lng,
         start.lat,
@@ -313,13 +618,14 @@
         start,
         end,
         tags,
+        resolved: resolvedParsed.success ? resolvedParsed.data : undefined,
       };
       overrides = {
         ...overrides,
         addedCrossings: [...overrides.addedCrossings, newEntry],
       };
       await saveOverrides(overrides);
-      appliedCount++;
+      appliedCrossingCount++;
       pointA = null;
       pointB = null;
     } catch (e) {
@@ -333,51 +639,121 @@
   }
 
   function onKeyDown(e: KeyboardEvent) {
-    if (e.key !== "a") return;
     if (
       e.target instanceof HTMLInputElement ||
       e.target instanceof HTMLTextAreaElement
     )
       return;
-    addCrossingSegmentFromDraft();
-    e.preventDefault();
+    if (e.key === "a") {
+      addCrossingSegmentFromDraft();
+      e.preventDefault();
+    } else if (e.key === "d") {
+      deleteSegmentFromDraft();
+      e.preventDefault();
+    }
+  }
+
+  type ResolvedDeletionJson = {
+    edges: Array<{
+      way_id: number;
+      node1: number;
+      node2: number;
+      node1_lat?: number;
+      node1_lng?: number;
+      node2_lat?: number;
+      node2_lng?: number;
+      mid_lat: number;
+      mid_lng: number;
+      draft_start_lat?: number;
+      draft_start_lng?: number;
+      draft_end_lat?: number;
+      draft_end_lng?: number;
+      tags: Record<string, string>;
+    }>;
+  };
+
+  async function deleteSegmentFromDraft() {
+    if (!pointA || !pointB || !$backend) return;
+    const draftStart = { lat: pointA.lat, lng: pointA.lng };
+    const draftEnd = { lat: pointB.lat, lng: pointB.lng };
+    loading = "Resolving manual deletion";
+    await refreshLoadingScreen();
+    try {
+      const raw = JSON.parse(
+        $backend.resolveManualDeletion(
+          pointA.lng,
+          pointA.lat,
+          pointB.lng,
+          pointB.lat,
+        ),
+      ) as ResolvedDeletionJson;
+      const edges = raw.edges ?? [];
+      if (edges.length === 0) {
+        applyError = "No segment found to delete.";
+        return;
+      }
+      const newEntries: DeletedWaySegment[] = edges.map((e) => ({
+        id: crypto.randomUUID(),
+        wayId: e.way_id,
+        node1: e.node1,
+        node2: e.node2,
+        node1Lat: e.node1_lat,
+        node1Lng: e.node1_lng,
+        node2Lat: e.node2_lat,
+        node2Lng: e.node2_lng,
+        midLat: e.mid_lat,
+        midLng: e.mid_lng,
+        draftStart:
+          e.draft_start_lat != null && e.draft_start_lng != null
+            ? { lat: e.draft_start_lat, lng: e.draft_start_lng }
+            : draftStart,
+        draftEnd:
+          e.draft_end_lat != null && e.draft_end_lng != null
+            ? { lat: e.draft_end_lat, lng: e.draft_end_lng }
+            : draftEnd,
+        tags: e.tags ?? {},
+      }));
+      overrides = {
+        ...overrides,
+        deletedWaySegments: [...overrides.deletedWaySegments, ...newEntries],
+      };
+      await saveOverrides(overrides);
+      if (overridesApplied) {
+        await applyChunk([], await resolveDeletionPayloadsForApply(newEntries));
+        appliedDeletionCount += newEntries.length;
+      }
+      applyError = "";
+      pointA = null;
+      pointB = null;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      applyError = msg || "Could not delete segment";
+    } finally {
+      loading = "";
+    }
   }
 
   async function removeAddedCrossing(segment: AddedCrossingSegment) {
     if (!$backend) return;
     const id = segment.id;
     const list = overrides.addedCrossings.filter((s) => s.id !== id);
-    const appliedOrder = segmentsInLoadedArea;
-    const deletedIndex = appliedOrder.findIndex((s) => s.id === id);
-    const wasApplied = deletedIndex >= 0 && deletedIndex < appliedCount;
+    const wasApplied = segmentsInLoadedArea.some((s) => s.id === id);
     overrides = { ...overrides, addedCrossings: list };
     await saveOverrides(overrides);
     if (wasApplied && $backend) {
-      loading = "Removing crossing";
+      loading = "Rebuilding manual overrides";
       await refreshLoadingScreen();
       try {
-        // Undo only until we've removed the command for this segment (backend stack order
-        // matches appliedOrder). Each undo replays the whole stack, so we do the minimum
-        // number of undos to avoid repeated ConnectAllCrossings etc.
-        const undosNeeded = appliedCount - deletedIndex;
-        for (let i = 0; i < undosNeeded; i++) {
-          $backend.editUndo();
-          mutationCounter.update((n) => n + 1);
-        }
-        // Re-apply segments that were after the deleted one (we popped them when we undid).
-        const toReapply = appliedOrder.slice(deletedIndex + 1, appliedCount);
-        for (const seg of toReapply) {
-          if (!isValidSegment(seg)) continue;
-          $backend.editAddCrossingSegment(
-            seg.start.lng,
-            seg.start.lat,
-            seg.end.lng,
-            seg.end.lat,
-            { ...crossingWayTags, ...seg.tags },
-          );
-          mutationCounter.update((n) => n + 1);
-        }
-        appliedCount = deletedIndex + toReapply.length;
+        const fastBackend = $backend as unknown as BatchCapableBackend;
+        fastBackend.editClearManualOverrides();
+        mutationCounter.update((n) => n + 1);
+        appliedCrossingCount = 0;
+        appliedDeletionCount = 0;
+        await applyEverythingInBoundary(segmentsInLoadedArea, deletionsInLoadedArea);
+        overridesApplied = appliedCrossingCount > 0 || appliedDeletionCount > 0;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        applyError = msg || "Failed to rebuild manual overrides";
       } finally {
         loading = "";
       }
@@ -398,24 +774,50 @@
     );
   }
 
+  function zoomToDeletion(seg: DeletedWaySegment) {
+    const pad = 0.0001;
+    $map?.fitBounds(
+      [
+        [seg.midLng - pad, seg.midLat - pad],
+        [seg.midLng + pad, seg.midLat + pad],
+      ],
+      { padding: 50, maxZoom: 18 },
+    );
+  }
+
   function exportOverrides() {
-    const blob = JSON.stringify(overrides, null, 2);
+    const prefixedDeleted = overrides.deletedWaySegments.map((seg) => ({
+      ...seg,
+      tags: Object.fromEntries(
+        Object.entries(seg.tags).map(([k, v]) => [`manually_deleted:${k}`, v]),
+      ),
+    }));
+    const payload: ManualOverrides = {
+      ...overrides,
+      deletedWaySegments: prefixedDeleted,
+    };
+    const blob = JSON.stringify(payload, null, 2);
     downloadGeneratedFile("speedwalk-overrides.json", blob);
   }
 
   async function deleteAllOverrides() {
-    const n = overrides.addedCrossings.length;
+    const n =
+      overrides.addedCrossings.length + overrides.deletedWaySegments.length;
     const msg =
       n === 0
         ? "There are no local overrides to delete."
         : `Delete all ${n} local override${n === 1 ? "" : "s"}? This will remove them from storage and from the map. This cannot be undone.`;
     if (!window.confirm(msg)) return;
-    if ($backend && appliedCount > 0) {
+    if ($backend && (appliedCrossingCount > 0 || appliedDeletionCount > 0)) {
       loading = "Removing overrides from map";
       await refreshLoadingScreen();
       await unapplyAll();
     }
-    overrides = { version: 1, addedCrossings: [] };
+    overrides = {
+      version: 1,
+      addedCrossings: [],
+      deletedWaySegments: [],
+    };
     await saveOverrides(overrides);
   }
 
@@ -446,29 +848,103 @@
     const toMerge = out.data.addedCrossings.map((seg) =>
       seg.id ? seg : { ...seg, id: crypto.randomUUID() },
     );
+    const toMergeDel = (out.data.deletedWaySegments ?? []).map((seg) =>
+      seg.id ? seg : { ...seg, id: crypto.randomUUID() },
+    );
+    const normalizedDel = toMergeDel.map((seg) => ({
+      ...seg,
+      tags: Object.fromEntries(
+        Object.entries(seg.tags).map(([k, v]) => {
+          if (k.startsWith("manually_deleted:")) {
+            return [k.slice("manually_deleted:".length), v];
+          }
+          return [k, v];
+        }),
+      ),
+    }));
     overrides = {
-      version: 1,
+      version: out.data.version ?? 1,
       addedCrossings: [...overrides.addedCrossings, ...toMerge],
+      deletedWaySegments: [...overrides.deletedWaySegments, ...normalizedDel],
     };
     await saveOverrides(overrides);
     input.value = "";
 
-    if (!$backend || toMerge.length === 0) return;
+    if (!$backend) return;
     if (!overridesApplied) return;
     applyError = "";
     try {
       const boundary = JSON.parse($backend.getBoundary());
       const inBoundary = filterSegmentsInBoundary(toMerge, boundary);
-      if (inBoundary.length > 0) {
-        const prevApplied = appliedCount;
-        await applyAll(inBoundary);
-        appliedCount = prevApplied + inBoundary.length;
+      const inBoundaryDel = filterDeletionsInBoundary(normalizedDel, boundary);
+      if (inBoundary.length > 0 || inBoundaryDel.length > 0) {
+        await applyEverythingInBoundary(inBoundary, inBoundaryDel, { append: true });
       }
     } catch (_) {}
   }
 
-  const appliedList = $derived(segmentsInLoadedArea.slice(0, appliedCount));
-  const notAppliedList = $derived(segmentsInLoadedArea.slice(appliedCount));
+  async function removeDeletedSegment(segment: DeletedWaySegment) {
+    if (!$backend) return;
+    const id = segment.id;
+    const list = overrides.deletedWaySegments.filter((s) => s.id !== id);
+    const wasApplied = deletionsInLoadedArea.some((s) => s.id === id);
+    overrides = { ...overrides, deletedWaySegments: list };
+    await saveOverrides(overrides);
+    if (wasApplied && $backend) {
+      loading = "Rebuilding manual overrides";
+      await refreshLoadingScreen();
+      try {
+        const fastBackend = $backend as unknown as BatchCapableBackend;
+        fastBackend.editClearManualOverrides();
+        mutationCounter.update((n) => n + 1);
+        appliedCrossingCount = 0;
+        appliedDeletionCount = 0;
+        await applyEverythingInBoundary(segmentsInLoadedArea, deletionsInLoadedArea);
+        overridesApplied = appliedCrossingCount > 0 || appliedDeletionCount > 0;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        applyError = msg || "Failed to rebuild manual overrides";
+      } finally {
+        loading = "";
+      }
+    }
+  }
+
+  const appliedCrossingList = $derived(
+    segmentsInLoadedArea.slice(0, appliedCrossingCount),
+  );
+  const notAppliedCrossingList = $derived(
+    segmentsInLoadedArea.slice(appliedCrossingCount),
+  );
+  const appliedDeletionList = $derived(
+    deletionsInLoadedArea.slice(0, appliedDeletionCount),
+  );
+  const notAppliedDeletionList = $derived(
+    deletionsInLoadedArea.slice(appliedDeletionCount),
+  );
+
+  const inViewSets = $derived.by(() => {
+    if (!viewportBounds) return null;
+    return inViewIdSets(
+      segmentsInLoadedArea,
+      deletionsInLoadedArea,
+      viewportBounds,
+    );
+  });
+
+  function crossingRowHighlightClass(seg: AddedCrossingSegment): string {
+    if (!inViewSets) return "";
+    return inViewSets.crossingIds.has(crossingStableId(seg))
+      ? "ps-2 border-start border-3 border-primary rounded-start"
+      : "";
+  }
+
+  function deletionRowHighlightClass(seg: DeletedWaySegment): string {
+    if (!inViewSets) return "";
+    return inViewSets.deletionIds.has(deletionStableId(seg))
+      ? "ps-2 border-start border-3 border-primary rounded-start"
+      : "";
+  }
 
   const draftLineGeoJSON = $derived.by(() => {
     const a = pointA;
@@ -511,6 +987,10 @@
       title="Manual overrides"
       lead="Modify the network by manually removing geometries and adding junctions. Changes are stored in your browser."
     >
+      <p class="small mb-2 text-muted">
+        Stored manual overrides are loaded for review first and only applied after you click
+        <strong> Apply manual overrides to current data</strong>.
+      </p>
       <p class="small mb-2">
         <strong>Add crossing:</strong>
         Place two points on the map (first = left/red, second = right/blue). Drag
@@ -526,6 +1006,15 @@
       <p class="small mb-2 text-muted">
         The new crossing is a routable segment between the two snapped points on
         the network.
+      </p>
+      <p class="small mb-2">
+        <strong>Delete segment:</strong>
+        Use the same two points on one road or path, then
+        <strong>Delete segment</strong>
+        or press
+        <kbd>d</kbd>
+        to remove those road edges from the routable network (they disappear from
+        the map here).
       </p>
       <div class="d-flex gap-2 align-items-center flex-wrap">
         <button
@@ -547,6 +1036,14 @@
         >
           Add crossing
         </button>
+        <button
+          type="button"
+          class="btn btn-outline-danger btn-sm"
+          onclick={() => deleteSegmentFromDraft()}
+          disabled={!pointA || !pointB || !$backend}
+        >
+          Delete segment
+        </button>
       </div>
     </Jumbotron>
 
@@ -555,8 +1052,10 @@
     {#if !$backend}
       <div class="alert alert-warning py-2 small mb-3" role="alert">
         <strong>Load an area first.</strong>
-        Add crossing (two clicks +
+        Add crossing (
         <kbd>a</kbd>
+        ) or delete segment (
+        <kbd>d</kbd>
         ), apply, and export/import are available after you load data (relation, polygon,
         or file).
       </div>
@@ -579,13 +1078,17 @@
 
     <CollapsibleCard open={true}>
       {#snippet header()}
-        In loaded area: {segmentsInLoadedArea.length} in storage, {appliedCount}
-        applied
+        In loaded area: {segmentsInLoadedArea.length} crossing(s), {deletionsInLoadedArea.length}
+        deletion(s) in storage; {appliedCrossingCount}+{appliedDeletionCount} applied
+        · In current view: {inViewSets?.crossingIds.size ?? 0} crossing(s), {inViewSets
+          ?.deletionIds.size ?? 0} deletion(s)
       {/snippet}
       {#snippet body()}
-        {#if segmentsInLoadedArea.length > 0}
+        {#if segmentsInLoadedArea.length > 0 || deletionsInLoadedArea.length > 0}
           <button
-            class="btn mb-3 {overridesApplied ? 'btn-secondary' : 'btn-primary'}"
+            class="btn mb-3 {overridesApplied
+              ? 'btn-secondary'
+              : 'btn-primary'}"
             onclick={toggleApply}
             disabled={!$backend}
           >
@@ -594,11 +1097,15 @@
               : "Apply manual overrides to current data"}
           </button>
         {/if}
-        {#if notAppliedList.length > 0}
-          <h6 class="mt-2">Not applied</h6>
+        {#if notAppliedCrossingList.length > 0}
+          <h6 class="mt-2">Crossings — not applied</h6>
           <ul class="list-unstyled small">
-            {#each notAppliedList as seg}
-              <li class="d-flex align-items-center gap-2 mb-1">
+            {#each notAppliedCrossingList as seg}
+              <li
+                class="d-flex align-items-center gap-2 mb-1 {crossingRowHighlightClass(
+                  seg,
+                )}"
+              >
                 <span class="text-break small">
                   {seg.start.lat.toFixed(4)},{seg.start.lng.toFixed(4)} → {seg.end.lat.toFixed(
                     4,
@@ -621,11 +1128,15 @@
             {/each}
           </ul>
         {/if}
-        {#if appliedList.length > 0}
-          <h6 class="mt-2">Applied</h6>
+        {#if appliedCrossingList.length > 0}
+          <h6 class="mt-2">Crossings — applied</h6>
           <ul class="list-unstyled small">
-            {#each appliedList as seg}
-              <li class="d-flex align-items-center gap-2 mb-1">
+            {#each appliedCrossingList as seg}
+              <li
+                class="d-flex align-items-center gap-2 mb-1 {crossingRowHighlightClass(
+                  seg,
+                )}"
+              >
                 <span class="text-break small">
                   {seg.start.lat.toFixed(4)},{seg.start.lng.toFixed(4)} → {seg.end.lat.toFixed(
                     4,
@@ -648,13 +1159,72 @@
             {/each}
           </ul>
         {/if}
-        {#if segmentsInLoadedArea.length === 0}
+        {#if notAppliedDeletionList.length > 0}
+          <h6 class="mt-2">Deletions — not applied</h6>
+          <ul class="list-unstyled small">
+            {#each notAppliedDeletionList as seg}
+              <li
+                class="d-flex align-items-center gap-2 mb-1 {deletionRowHighlightClass(
+                  seg,
+                )}"
+              >
+                <span class="text-break small">
+                  way {seg.wayId} nodes {seg.node1}–{seg.node2}
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-link p-0 small text-primary"
+                  onclick={() => zoomToDeletion(seg)}
+                >
+                  Zoom
+                </button>
+                <button
+                  class="btn btn-sm btn-outline-danger"
+                  onclick={() => removeDeletedSegment(seg)}
+                >
+                  Remove
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if appliedDeletionList.length > 0}
+          <h6 class="mt-2">Deletions — applied</h6>
+          <ul class="list-unstyled small">
+            {#each appliedDeletionList as seg}
+              <li
+                class="d-flex align-items-center gap-2 mb-1 {deletionRowHighlightClass(
+                  seg,
+                )}"
+              >
+                <span class="text-break small">
+                  way {seg.wayId} nodes {seg.node1}–{seg.node2}
+                </span>
+                <button
+                  type="button"
+                  class="btn btn-link p-0 small text-primary"
+                  onclick={() => zoomToDeletion(seg)}
+                >
+                  Zoom
+                </button>
+                <button
+                  class="btn btn-sm btn-outline-danger"
+                  onclick={() => removeDeletedSegment(seg)}
+                >
+                  Remove
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if segmentsInLoadedArea.length === 0 && deletionsInLoadedArea.length === 0}
           <p class="text-muted small">
-            {#if overrides.addedCrossings.length === 0}
-              No manual crossings yet.
+            {#if overrides.addedCrossings.length === 0 && overrides.deletedWaySegments.length === 0}
+              No manual crossings or deletions yet.
             {:else}
-              No overrides in loaded area ({overrides.addedCrossings.length} total
-              in storage).
+              No overrides in loaded area ({overrides.addedCrossings.length} crossing(s),
+              {overrides.deletedWaySegments.length}
+              deletion(s) total in storage).
             {/if}
           </p>
         {/if}
@@ -665,7 +1235,9 @@
       <button
         class="btn btn-secondary btn-sm me-1"
         onclick={exportOverrides}
-        disabled={!$backend || overrides.addedCrossings.length === 0}
+        disabled={!$backend ||
+          (overrides.addedCrossings.length === 0 &&
+            overrides.deletedWaySegments.length === 0)}
       >
         Export overrides
       </button>
@@ -679,7 +1251,8 @@
       <button
         class="btn btn-outline-danger btn-sm"
         onclick={() => deleteAllOverrides()}
-        disabled={overrides.addedCrossings.length === 0}
+        disabled={overrides.addedCrossings.length === 0 &&
+          overrides.deletedWaySegments.length === 0}
       >
         Delete all overrides
       </button>
@@ -699,9 +1272,30 @@
             "line-color": [
               "case",
               ["==", ["get", "crossing"], "manual"],
-              "blue",
-              "black",
+              overridesLegendColors["Manually added crossing"],
+              overridesLegendColors["Base data"],
             ],
+          }}
+        />
+      </GeoJSON>
+      <GeoJSON data={deletedResolvedEdgesGeoJSON} generateId>
+        <LineLayer
+          id="overrides-deleted-resolved"
+          paint={{
+            "line-width": 1,
+            "line-opacity": 0.5,
+            "line-color": overridesLegendColors["Manually deleted way"],
+            "line-dasharray": [1, 1],
+          }}
+        />
+      </GeoJSON>
+      <GeoJSON data={deletedDraftLinesGeoJSON} generateId>
+        <LineLayer
+          id="overrides-deleted-drafts"
+          paint={{
+            "line-width": 3,
+            "line-color": overridesLegendColors["Manually deleted way"],
+            "line-dasharray": [2, 2],
           }}
         />
       </GeoJSON>
@@ -713,8 +1307,8 @@
             "circle-color": [
               "case",
               ["get", "is_manual_crossing"],
-              "blue",
-              "black",
+              overridesLegendColors["Manually added crossing"],
+              overridesLegendColors["Base data"],
             ],
           }}
         />

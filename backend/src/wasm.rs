@@ -4,14 +4,47 @@ use std::sync::Once;
 use anyhow::Result;
 use geo::{Euclidean, Length, Point, Polygon};
 use geojson::{Feature, GeoJson, Geometry};
-use osm_reader::WayID;
-use serde::Serialize;
+use osm_reader::{NodeID, WayID};
+use serde::{Deserialize, Serialize};
 use utils::{OffsetCurve, Tags};
 use wasm_bindgen::prelude::*;
 
 use crate::{Edits, Kind, Speedwalk, UserCmd};
 
 static START: Once = Once::new();
+
+#[derive(Deserialize)]
+struct BatchPoint {
+    lat: f64,
+    lng: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchResolvedCrossingInput {
+    start_way: i64,
+    end_way: i64,
+    start: BatchPoint,
+    end: BatchPoint,
+}
+
+#[derive(Deserialize)]
+struct BatchCrossingInput {
+    start: BatchPoint,
+    end: BatchPoint,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+    #[serde(default)]
+    resolved: Option<BatchResolvedCrossingInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchDeletionInput {
+    way_id: i64,
+    node1: i64,
+    node2: i64,
+}
 
 #[wasm_bindgen]
 impl Speedwalk {
@@ -255,6 +288,15 @@ impl Speedwalk {
         Ok(())
     }
 
+    #[wasm_bindgen(js_name = editApplyMaxspeed)]
+    pub fn edit_apply_maxspeed(&mut self) -> Result<(), JsValue> {
+        let mut edits = self.edits.take().unwrap();
+        let _ = edits.apply_cmd(UserCmd::ApplyMaxspeed, self);
+        self.edits = Some(edits);
+        self.after_edit();
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = editSetTags)]
     pub fn edit_set_tags(
         &mut self,
@@ -363,13 +405,135 @@ impl Speedwalk {
     ) -> Result<String, JsValue> {
         let start = Point::new(start_lng, start_lat);
         let end = Point::new(end_lng, end_lat);
-        let (s_start, s_end) =
-            crate::edits::snap_crossing_segment(self, start, end).map_err(err_to_js)?;
+        let resolved =
+            crate::edits::resolve_crossing_segment(self, start, end).map_err(err_to_js)?;
         let out = serde_json::json!({
-            "start": { "lat": s_start.y(), "lng": s_start.x() },
-            "end": { "lat": s_end.y(), "lng": s_end.x() }
+            "start": { "lat": resolved.start_lat, "lng": resolved.start_lng },
+            "end": { "lat": resolved.end_lat, "lng": resolved.end_lng },
+            "startWay": resolved.start_way,
+            "endWay": resolved.end_way
         });
         serde_json::to_string(&out).map_err(err_to_js)
+    }
+
+    /// Resolve which graph edges lie between two draft points (same snap as crossings). JSON: `{ "edges": [...] }`.
+    #[wasm_bindgen(js_name = resolveManualDeletion)]
+    pub fn resolve_manual_deletion_wasm(
+        &self,
+        start_lng: f64,
+        start_lat: f64,
+        end_lng: f64,
+        end_lat: f64,
+    ) -> Result<String, JsValue> {
+        let start = Point::new(start_lng, start_lat);
+        let end = Point::new(end_lng, end_lat);
+        let resolved =
+            crate::edits::resolve_manual_deletion_edges(self, start, end).map_err(err_to_js)?;
+        serde_json::to_string(&serde_json::json!({ "edges": resolved })).map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = editManualDeleteEdge)]
+    pub fn edit_manual_delete_edge(
+        &mut self,
+        way_id: i64,
+        node1: i64,
+        node2: i64,
+    ) -> Result<(), JsValue> {
+        let mut edits = self.edits.take().unwrap();
+        edits
+            .apply_cmd(
+                UserCmd::ManualDeleteEdge {
+                    way: WayID(way_id),
+                    node1: NodeID(node1),
+                    node2: NodeID(node2),
+                },
+                self,
+            )
+            .map_err(err_to_js)?;
+        self.edits = Some(edits);
+        self.after_edit();
+        Ok(())
+    }
+
+    /// Apply many manual overrides in one call. This batches commands and rebuilds derived state once.
+    #[wasm_bindgen(js_name = editApplyManualOverridesBatch)]
+    pub fn edit_apply_manual_overrides_batch(
+        &mut self,
+        crossings_js: JsValue,
+        deletions_js: JsValue,
+    ) -> Result<(), JsValue> {
+        let crossings: Vec<BatchCrossingInput> = serde_wasm_bindgen::from_value(crossings_js)?;
+        let deletions: Vec<BatchDeletionInput> = serde_wasm_bindgen::from_value(deletions_js)?;
+        let mut cmds = Vec::with_capacity(crossings.len() + deletions.len());
+
+        for crossing in crossings {
+            let mut tags = Tags::empty();
+            for (k, v) in crossing.tags {
+                tags.insert(&k, &v);
+            }
+            if let Some(resolved) = crossing.resolved {
+                cmds.push(UserCmd::AddCrossingSegmentSnapped {
+                    start_way: WayID(resolved.start_way),
+                    end_way: WayID(resolved.end_way),
+                    snapped_start_wgs84: Point::new(resolved.start.lng, resolved.start.lat),
+                    snapped_end_wgs84: Point::new(resolved.end.lng, resolved.end.lat),
+                    tags,
+                });
+            } else {
+                cmds.push(UserCmd::AddCrossingSegment(
+                    Point::new(crossing.start.lng, crossing.start.lat),
+                    Point::new(crossing.end.lng, crossing.end.lat),
+                    tags,
+                ));
+            }
+        }
+
+        for deletion in deletions {
+            cmds.push(UserCmd::ManualDeleteEdge {
+                way: WayID(deletion.way_id),
+                node1: NodeID(deletion.node1),
+                node2: NodeID(deletion.node2),
+            });
+        }
+
+        let mut edits = self.edits.take().unwrap();
+        edits
+            .apply_cmds_without_rebuild(cmds, self)
+            .map_err(err_to_js)?;
+        self.edits = Some(edits);
+        self.after_edit();
+        Ok(())
+    }
+
+    /// Clear manual override commands (manual crossing adds + manual edge deletions), preserving all
+    /// other edit commands.
+    ///
+    /// Replays remaining commands one-by-one with `after_edit()` after each (same as [`edit_undo`]),
+    /// so `apply_cmd` always sees a [`Speedwalk`] graph consistent with the command history.
+    /// Batching with [`Edits::apply_cmds_without_rebuild`] against a stale derived graph can produce
+    /// invalid `change_way_nodes` / `change_way_tags` keys and panic in [`Speedwalk::after_edit`].
+    #[wasm_bindgen(js_name = editClearManualOverrides)]
+    pub fn edit_clear_manual_overrides(&mut self) -> Result<(), JsValue> {
+        let mut cmds = self.edits.take().unwrap().user_commands;
+        cmds.retain(|cmd| {
+            !matches!(
+                cmd,
+                UserCmd::AddCrossingSegment(_, _, _)
+                    | UserCmd::AddCrossingSegmentSnapped { .. }
+                    | UserCmd::ManualDeleteEdge { .. }
+            )
+        });
+
+        self.edits = Some(Edits::default());
+        self.after_edit();
+
+        for cmd in cmds {
+            let mut edits = self.edits.take().unwrap();
+            edits.apply_cmd(cmd, self).map_err(err_to_js)?;
+            self.edits = Some(edits);
+            self.after_edit();
+        }
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = editUndo)]
