@@ -462,6 +462,15 @@ impl Edits {
                     .map(|(id, way)| (*id, way.linestring.clone(), way.tags.clone()))
                     .collect();
 
+                let total_crossings_without_maxspeed = crossings.len();
+                info!(
+                    "ApplyMaxspeed: {} crossings without maxspeed to process",
+                    total_crossings_without_maxspeed
+                );
+
+                let mut enriched = 0usize;
+                let mut missing = 0usize;
+
                 for (crossing_id, linestring, tags) in crossings {
                     let mut candidates: Vec<String> = Vec::new();
 
@@ -505,8 +514,16 @@ impl Edits {
                             .entry(crossing_id)
                             .or_default()
                             .push(TagCmd::Set("maxspeed".to_string(), ms_val));
+                        enriched += 1;
+                    } else {
+                        missing += 1;
                     }
                 }
+
+                info!(
+                    "ApplyMaxspeed: enriched {} crossings, {} have no maxspeed data on crossed road",
+                    enriched, missing
+                );
             }
             UserCmd::AddCrossingSegmentSnapped {
                 start_way,
