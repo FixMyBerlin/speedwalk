@@ -265,7 +265,7 @@ impl Speedwalk {
         let remove_keys: Vec<String> = serde_wasm_bindgen::from_value(remove_keys)?;
         let add_tags: Vec<Vec<String>> = serde_wasm_bindgen::from_value(add_tags)?;
         let mut edits = self.edits.take().unwrap();
-        edits
+        let result = edits
             .apply_cmd(
                 UserCmd::SetTags {
                     way: WayID(base),
@@ -277,8 +277,9 @@ impl Speedwalk {
                 },
                 self,
             )
-            .map_err(err_to_js)?;
+            .map_err(err_to_js);
         self.edits = Some(edits);
+        result?;
         self.after_edit();
         Ok(())
     }
@@ -290,10 +291,11 @@ impl Speedwalk {
         let mut tags = Tags::empty();
         tags.insert("highway", "crossing");
         tags.insert("crossing", "traffic_signals");
-        edits
+        let result = edits
             .apply_cmd(UserCmd::AddCrossings(vec![Point::new(x, y)], tags), self)
-            .map_err(err_to_js)?;
+            .map_err(err_to_js);
         self.edits = Some(edits);
+        result?;
         self.after_edit();
         Ok(())
     }
@@ -312,10 +314,11 @@ impl Speedwalk {
             tags.insert(&k, &v);
         }
         let mut edits = self.edits.take().unwrap();
-        edits
+        let result = edits
             .apply_cmd(UserCmd::AddCrossings(vec![Point::new(x, y)], tags), self)
-            .map_err(err_to_js)?;
+            .map_err(err_to_js);
         self.edits = Some(edits);
+        result?;
         self.after_edit();
         Ok(())
     }
@@ -339,10 +342,11 @@ impl Speedwalk {
         let start = Point::new(start_lng, start_lat);
         let end = Point::new(end_lng, end_lat);
         let mut edits = self.edits.take().unwrap();
-        edits
+        let result = edits
             .apply_cmd(UserCmd::AddCrossingSegment(start, end, tags), self)
-            .map_err(err_to_js)?;
+            .map_err(err_to_js);
         self.edits = Some(edits);
+        result?;
         self.after_edit();
         Ok(())
     }
@@ -378,8 +382,9 @@ impl Speedwalk {
         // We have to start over and replay almost all the commands
         for cmd in cmds {
             let mut edits = self.edits.take().unwrap();
-            edits.apply_cmd(cmd, self).map_err(err_to_js)?;
+            let result = edits.apply_cmd(cmd, self).map_err(err_to_js);
             self.edits = Some(edits);
+            result?;
             self.after_edit();
         }
         Ok(())
