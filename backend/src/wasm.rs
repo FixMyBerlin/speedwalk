@@ -496,13 +496,11 @@ impl Speedwalk {
             });
         }
 
-        let mut edits = self.edits.take().unwrap();
-        edits
-            .apply_cmds_without_rebuild(cmds, self)
-            .map_err(err_to_js)?;
-        self.edits = Some(edits);
+        let mut edits = self.edits.take().unwrap_or_default();
+        let result = edits.apply_cmds_without_rebuild(cmds, self);
+        self.edits = Some(edits); // always restore — prevents cascading panics on retry
         self.after_edit();
-        Ok(())
+        result.map_err(err_to_js)
     }
 
     /// Clear manual override commands (manual crossing adds + manual edge deletions), preserving all

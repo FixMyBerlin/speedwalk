@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use log::warn;
+
 use anyhow::Result;
 use geo::{Closest, ClosestPoint, Coord, Distance, Euclidean, Haversine, LineString, Point};
 use osm_reader::{NodeID, WayID};
@@ -569,7 +571,18 @@ impl Edits {
         model: &Speedwalk,
     ) -> Result<()> {
         for cmd in cmds {
-            self.apply_cmd(cmd, model)?;
+            let skip_on_error = matches!(
+                cmd,
+                UserCmd::AddCrossingSegment(..) | UserCmd::AddCrossingSegmentSnapped { .. }
+            );
+            let result = self.apply_cmd(cmd, model);
+            if skip_on_error {
+                if let Err(e) = result {
+                    warn!("[Overrides] Skipping crossing that failed to snap: {e}");
+                }
+            } else {
+                result?;
+            }
         }
         Ok(())
     }

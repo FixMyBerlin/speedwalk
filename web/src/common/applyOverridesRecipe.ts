@@ -79,21 +79,29 @@ export async function applyStoredOverrides(backend: unknown): Promise<void> {
   }
 
   const deletionPayloads: BatchDeletionPayload[] = [];
-  const seen = new Set<string>();
-  for (const draft of drafts.values()) {
-    const raw = JSON.parse(
-      b.resolveManualDeletion(
-        draft.start.lng,
-        draft.start.lat,
-        draft.end.lng,
-        draft.end.lat,
-      ),
-    ) as ResolvedDeletionJson;
-    for (const e of raw.edges ?? []) {
-      const key = `${e.way_id}:${e.node1}:${e.node2}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        deletionPayloads.push({ wayId: e.way_id, node1: e.node1, node2: e.node2 });
+  if (!("resolveManualDeletion" in b)) {
+    if (drafts.size > 0) {
+      console.warn(
+        "[Overrides] resolveManualDeletion not available in this WASM build; deletions skipped",
+      );
+    }
+  } else {
+    const seen = new Set<string>();
+    for (const draft of drafts.values()) {
+      const raw = JSON.parse(
+        b.resolveManualDeletion(
+          draft.start.lng,
+          draft.start.lat,
+          draft.end.lng,
+          draft.end.lat,
+        ),
+      ) as ResolvedDeletionJson;
+      for (const e of raw.edges ?? []) {
+        const key = `${e.way_id}:${e.node1}:${e.node2}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          deletionPayloads.push({ wayId: e.way_id, node1: e.node1, node2: e.node2 });
+        }
       }
     }
   }
