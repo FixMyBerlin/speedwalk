@@ -8,7 +8,7 @@
   } from "svelte-maplibre";
   import { SplitComponent } from "svelte-utils/top_bar_layout";
   import { localStorageStore } from "svelte-utils";
-  import { backend, mutationCounter, refreshLoadingScreen } from "../";
+  import { backend, mutationCounter, refreshLoadingScreen, recipeSteps } from "../";
   import type { FeatureCollection } from "geojson";
   import { emptyGeojson } from "svelte-utils/map";
   import CollapsibleCard from "../common/CollapsibleCard.svelte";
@@ -79,6 +79,7 @@
     await refreshLoadingScreen();
     $backend!.editApplyMaxspeed();
     $mutationCounter++;
+    recipeSteps.update((s) => [...s, { op: "applyMaxspeed" }]);
     working = false;
   }
 </script>
