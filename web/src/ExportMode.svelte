@@ -44,11 +44,20 @@
       );
       return;
     }
-    const encoded = encodeRecipe({ v: 1, steps });
+    const filter = $networkFilter;
+    const stepsWithFilter = [
+      ...steps,
+      {
+        op: "setNetworkFilter" as const,
+        include: filter.include,
+        ignore_deadends: filter.ignore_deadends,
+      },
+    ];
+    const encoded = encodeRecipe({ v: 1, steps: stepsWithFilter });
     const url = new URL(window.location.href);
     url.searchParams.set("recipe", encoded);
     navigator.clipboard.writeText(url.toString());
-    copiedSteps = steps;
+    copiedSteps = stepsWithFilter;
     copyFeedback = true;
     setTimeout(() => (copyFeedback = false), 2000);
   }

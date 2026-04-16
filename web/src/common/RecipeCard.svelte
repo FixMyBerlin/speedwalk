@@ -2,6 +2,7 @@
   import {
     backend,
     mutationCounter,
+    networkFilter,
     pendingRecipe,
     recipeSteps,
     crossingScopeBulk,
@@ -77,6 +78,13 @@
         break;
       case "applyMaxspeed":
         $backend!.editApplyMaxspeed();
+        recipeSteps.update((s) => [...s, step]);
+        break;
+      case "setNetworkFilter":
+        networkFilter.set({
+          include: step.include,
+          ignore_deadends: step.ignore_deadends,
+        });
         recipeSteps.update((s) => [...s, step]);
         break;
     }
