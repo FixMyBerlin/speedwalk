@@ -260,10 +260,22 @@
   }
 
   type BatchCrossingPayload = {
+    id?: string;
     start: { lng: number; lat: number };
     end: { lng: number; lat: number };
     tags: Record<string, string>;
     resolved?: ResolvedCrossingSegment;
+  };
+
+  type BatchApplyResult = {
+    failedCrossingIds: string[];
+    rematchedCrossings: Array<{
+      id: string;
+      startWay: number;
+      endWay: number;
+      start: { lat: number; lng: number };
+      end: { lat: number; lng: number };
+    }>;
   };
 
   type BatchDeletionPayload = {
@@ -274,6 +286,7 @@
 
   function toBatchCrossing(seg: AddedCrossingSegment): BatchCrossingPayload {
     return {
+      id: seg.id,
       start: seg.start,
       end: seg.end,
       tags: { ...crossingWayTags, ...seg.tags },
@@ -299,7 +312,7 @@
     editApplyManualOverridesBatch: (
       crossings: BatchCrossingPayload[],
       deletions: BatchDeletionPayload[],
-    ) => void;
+    ) => BatchApplyResult;
     editClearManualOverrides: () => void;
   };
 
@@ -381,16 +394,17 @@
   async function applyChunk(
     crossingsChunk: AddedCrossingSegment[],
     deletionsChunk: BatchDeletionPayload[],
-  ): Promise<void> {
-    if (!$backend) return;
+  ): Promise<BatchApplyResult> {
+    const emptyResult: BatchApplyResult = { failedCrossingIds: [], rematchedCrossings: [] };
+    if (!$backend) return emptyResult;
     const batchBackend = $backend as unknown as BatchCapableBackend;
     if (batchBackend.editApplyManualOverridesBatch) {
-      batchBackend.editApplyManualOverridesBatch(
+      const result = batchBackend.editApplyManualOverridesBatch(
         crossingsChunk.map(toBatchCrossing),
         deletionsChunk,
       );
       mutationCounter.update((n) => n + 1);
-      return;
+      return result ?? emptyResult;
     }
 
     // Fallback when running older wasm package without batch API.
@@ -409,6 +423,7 @@
       $backend.editManualDeleteEdge(BigInt(d.wayId), BigInt(d.node1), BigInt(d.node2));
       mutationCounter.update((n) => n + 1);
     }
+    return emptyResult;
   }
 
   /** Apply crossings first, then manual deletions (matches backend undo order). */
@@ -438,6 +453,9 @@
       let processedDeletions = 0;
       let step = 0;
 
+      const allFailedCrossingIds = new Set<string>();
+      const allRematchedCrossings: BatchApplyResult["rematchedCrossings"] = [];
+
       for (const chunk of crossingChunks) {
         step++;
         const processedBeforeChunk = processedCrossings + processedDeletions;
@@ -450,7 +468,9 @@
         );
         console.info("[Overrides]", loading);
         await refreshLoadingScreen();
-        await applyChunk(chunk, []);
+        const chunkResult = await applyChunk(chunk, []);
+        for (const id of chunkResult.failedCrossingIds) allFailedCrossingIds.add(id);
+        allRematchedCrossings.push(...chunkResult.rematchedCrossings);
         processedCrossings += chunk.length;
         appliedCrossingCount = baseCrossings + processedCrossings;
       }
@@ -470,6 +490,42 @@
         await applyChunk([], chunk);
         processedDeletions += chunk.length;
         appliedDeletionCount = baseDeletions + deletions.length;
+      }
+
+      // Persist re-matched resolved data and failed flags into IndexedDB
+      if (allFailedCrossingIds.size > 0 || allRematchedCrossings.length > 0) {
+        const rematchById = new Map(allRematchedCrossings.map((r) => [r.id, r]));
+        let changed = false;
+        for (const seg of overrides.addedCrossings) {
+          if (!seg.id) continue;
+          const rematched = rematchById.get(seg.id);
+          if (rematched) {
+            seg.resolved = {
+              startWay: rematched.startWay,
+              endWay: rematched.endWay,
+              start: rematched.start,
+              end: rematched.end,
+            };
+            seg.rematched = true;
+            seg.failed = undefined;
+            changed = true;
+          } else if (allFailedCrossingIds.has(seg.id)) {
+            seg.failed = true;
+            seg.rematched = undefined;
+            changed = true;
+          }
+        }
+        if (changed) await saveOverrides(overrides);
+        if (allFailedCrossingIds.size > 0) {
+          console.warn(
+            `[Overrides] ${allFailedCrossingIds.size} crossing(s) could not be re-snapped after data update and are marked as failed.`,
+          );
+        }
+        if (allRematchedCrossings.length > 0) {
+          console.info(
+            `[Overrides] ${allRematchedCrossings.length} crossing(s) were automatically re-matched to updated road data.`,
+          );
+        }
       }
 
       const durationMs = Math.round(performance.now() - startTimeMs);
@@ -1147,6 +1203,17 @@
                   seg,
                 )}"
               >
+                {#if seg.failed}
+                  <span
+                    class="text-danger"
+                    title="Could not be re-snapped after data update — please redraw or remove"
+                  >⚠</span>
+                {:else if seg.rematched}
+                  <span
+                    class="text-warning"
+                    title="Automatically re-matched to updated road data — verify position and re-export if needed"
+                  >⚠</span>
+                {/if}
                 <span class="text-break small">
                   {seg.start.lat.toFixed(4)},{seg.start.lng.toFixed(4)} → {seg.end.lat.toFixed(
                     4,
@@ -1178,6 +1245,17 @@
                   seg,
                 )}"
               >
+                {#if seg.failed}
+                  <span
+                    class="text-danger"
+                    title="Could not be re-snapped after data update — please redraw or remove"
+                  >⚠</span>
+                {:else if seg.rematched}
+                  <span
+                    class="text-warning"
+                    title="Automatically re-matched to updated road data — verify position and re-export if needed"
+                  >⚠</span>
+                {/if}
                 <span class="text-break small">
                   {seg.start.lat.toFixed(4)},{seg.start.lng.toFixed(4)} → {seg.end.lat.toFixed(
                     4,
