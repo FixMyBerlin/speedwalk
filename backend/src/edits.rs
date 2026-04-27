@@ -348,11 +348,11 @@ impl Edits {
             }
             UserCmd::MakeAllSidewalks(only_severances) => {
                 let results = model.make_all_sidewalks(only_severances);
-                self.create_new_geometry(results, model);
+                self.create_new_geometry(results, model)?;
             }
             UserCmd::ConnectAllCrossings(include_crossing_no) => {
                 let results = model.connect_all_crossings(include_crossing_no);
-                self.create_new_geometry(results, model);
+                self.create_new_geometry(results, model)?;
             }
             UserCmd::AssumeTags(drive_on_left) => {
                 for (id, way) in &model.derived_ways {
@@ -414,7 +414,7 @@ impl Edits {
                         modify_existing_way_tags: HashMap::new(),
                     },
                     model,
-                );
+                )?;
             }
             UserCmd::AddCrossingSegment(start_wgs84, end_wgs84, way_tags) => {
                 let snapped = snap_crossing_segment_with_way_ids(model, start_wgs84, end_wgs84)?;
@@ -439,7 +439,7 @@ impl Edits {
                         modify_existing_way_tags: HashMap::new(),
                     },
                     model,
-                );
+                )?;
             }
             UserCmd::ApplyMaxspeed => {
                 use geo::{BoundingRect, Intersects};
@@ -556,7 +556,7 @@ impl Edits {
                         modify_existing_way_tags: HashMap::new(),
                     },
                     model,
-                );
+                )?;
             }
             UserCmd::ManualDeleteEdge { way, node1, node2 } => {
                 self.manual_deleted_edges.insert((way, node1, node2));
@@ -587,7 +587,7 @@ impl Edits {
         Ok(())
     }
 
-    fn create_new_geometry(&mut self, results: CreateNewGeometry, model: &Speedwalk) {
+    fn create_new_geometry(&mut self, results: CreateNewGeometry, model: &Speedwalk) -> Result<()> {
         // TODO Or use+modify new_nodes immediately or something?
         let mut node_mapping: HashMap<HashedPoint, NodeID> = HashMap::new();
         // Insert all existing nodes. When we create crossing ways from a crossing node, we don't
@@ -598,8 +598,11 @@ impl Edits {
 
         // Modify existing ways first
         for (way_id, insert_points) in results.insert_new_nodes {
-            let mut node_ids = model.derived_ways[&way_id].node_ids.clone();
-            let mut linestring = model.derived_ways[&way_id].linestring.clone();
+            let way = model.derived_ways.get(&way_id).ok_or_else(|| {
+                anyhow::anyhow!("way {:?} no longer exists in derived_ways (stale override after recipe update?)", way_id)
+            })?;
+            let mut node_ids = way.node_ids.clone();
+            let mut linestring = way.linestring.clone();
 
             for (pt, tags) in insert_points {
                 let node_id = self.new_node_id();
@@ -682,6 +685,7 @@ impl Edits {
                 .or_insert_with(Vec::new)
                 .extend(cmds);
         }
+        Ok(())
     }
 
     pub fn to_osc(&self, model: &Speedwalk) -> String {
