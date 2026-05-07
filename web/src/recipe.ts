@@ -28,6 +28,7 @@ export type RecipeStep =
   | { op: "assumeTags"; driveOnLeft: boolean }
   | { op: "applyOverrides" }
   | { op: "applyMaxspeed" }
+  | { op: "applyCrossingNodeTags" }
   | {
       op: "setNetworkFilter";
       include: NetworkFilterInclude;
@@ -80,6 +81,8 @@ export function stepLabel(step: RecipeStep): string {
       return "Overrides: Apply manual overrides (local)";
     case "applyMaxspeed":
       return "Maxspeed: Enrich crossings with maxspeed";
+    case "applyCrossingNodeTags":
+      return "Crossing: Enrich ways with node crossing tags";
     case "setNetworkFilter": {
       const includeLabel: Record<NetworkFilterInclude, string> = {
         Everything: "Full network",

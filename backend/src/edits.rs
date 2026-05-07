@@ -310,6 +310,8 @@ pub enum UserCmd {
     },
     /// Enrich all crossing ways with the maxspeed from the road they cross.
     ApplyMaxspeed,
+    /// Enrich crossing ways with crossing tags from nodes that lie on them.
+    ApplyCrossingNodeTags,
 }
 
 pub enum TagCmd {
@@ -526,6 +528,50 @@ impl Edits {
                     "ApplyMaxspeed: enriched {} crossings, {} have no maxspeed data on crossed road",
                     enriched, missing
                 );
+            }
+            UserCmd::ApplyCrossingNodeTags => {
+                const CROSSING_EXTRA_KEYS: &[&str] = &[
+                    "tactile_paving",
+                    "button_operated",
+                    "flashing_lights",
+                    "supervised",
+                ];
+
+                let crossings: Vec<(WayID, Vec<NodeID>, Tags)> = model
+                    .derived_ways
+                    .iter()
+                    .filter(|(_, way)| way.kind == Kind::Crossing)
+                    .map(|(id, way)| (*id, way.node_ids.clone(), way.tags.clone()))
+                    .collect();
+
+                let mut enriched = 0usize;
+                for (way_id, node_ids, way_tags) in crossings {
+                    let mut tags_to_add: Vec<(String, String)> = Vec::new();
+                    for node_id in &node_ids {
+                        if let Some(node) = model.derived_nodes.get(node_id) {
+                            for (k, v) in &node.tags.0 {
+                                let relevant = k.starts_with("crossing")
+                                    || CROSSING_EXTRA_KEYS.contains(&k.as_str());
+                                if relevant
+                                    && !way_tags.has(k)
+                                    && !tags_to_add.iter().any(|(tk, _)| tk == k)
+                                {
+                                    tags_to_add.push((k.clone(), v.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if !tags_to_add.is_empty() {
+                        for (k, v) in tags_to_add {
+                            self.change_way_tags
+                                .entry(way_id)
+                                .or_default()
+                                .push(TagCmd::Set(k, v));
+                        }
+                        enriched += 1;
+                    }
+                }
+                info!("ApplyCrossingNodeTags: enriched {} crossing ways", enriched);
             }
             UserCmd::AddCrossingSegmentSnapped {
                 start_way,

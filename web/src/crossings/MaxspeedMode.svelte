@@ -7,7 +7,7 @@
     Control,
   } from "svelte-maplibre";
   import { SplitComponent } from "svelte-utils/top_bar_layout";
-  import { localStorageStore } from "svelte-utils";
+  import { localStorageStore, Loading } from "svelte-utils";
   import { backend, mutationCounter, refreshLoadingScreen, recipeSteps } from "../";
   import type { FeatureCollection } from "geojson";
   import { emptyGeojson } from "svelte-utils/map";
@@ -72,17 +72,24 @@
     crossings.features.length - crossingsWithMaxspeed,
   );
 
-  let working = $state(false);
+  let loading = $state("");
 
   async function applyMaxspeed() {
-    working = true;
+    loading = "Applying maxspeed to crossings";
     await refreshLoadingScreen();
-    $backend!.editApplyMaxspeed();
-    $mutationCounter++;
-    recipeSteps.update((s) => [...s, { op: "applyMaxspeed" }]);
-    working = false;
+    try {
+      $backend!.editApplyMaxspeed();
+      $mutationCounter++;
+      recipeSteps.update((s) => [...s, { op: "applyMaxspeed" }]);
+    } catch (err) {
+      window.alert(`Error: ${err}`);
+    } finally {
+      loading = "";
+    }
   }
 </script>
+
+<Loading {loading} />
 
 <SplitComponent>
   {#snippet left()}
@@ -133,13 +140,8 @@
       </div>
     </div>
 
-    <button class="btn btn-primary mb-3" onclick={applyMaxspeed} disabled={working}>
-      {#if working}
-        <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
-        Applying…
-      {:else}
-        Apply maxspeed to all crossings
-      {/if}
+    <button class="btn btn-primary mb-3" onclick={applyMaxspeed}>
+      Apply maxspeed to all crossings
     </button>
   {/snippet}
 

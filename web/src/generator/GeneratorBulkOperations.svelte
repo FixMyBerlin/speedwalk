@@ -83,6 +83,20 @@
     }
   }
 
+  async function applyCrossingNodeTags() {
+    loading = "Enriching crossings with node tags";
+    await refreshLoadingScreen();
+    try {
+      $backend!.editApplyCrossingNodeTags();
+      $mutationCounter++;
+      recipeSteps.update((s) => [...s, { op: "applyCrossingNodeTags" }]);
+    } catch (err) {
+      window.alert(`Error: ${err}`);
+    } finally {
+      loading = "";
+    }
+  }
+
   async function assumeTags() {
     loading = "Inferring sidewalks around one-ways";
     await refreshLoadingScreen();
@@ -164,6 +178,20 @@
     </LocalStorageWrapper>
     <button class="btn btn-secondary" onclick={connectAllCrossings}>
       Create a way for every crossing node
+    </button>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header">Enrich crossings with node tags</div>
+  <div class="card-body">
+    <p class="small text-muted mb-2">
+      Transfers <code>crossing=*</code>, <code>crossing:island</code>,
+      <code>tactile_paving</code> and related tags from OSM crossing nodes onto
+      their crossing ways, for better routing scores.
+    </p>
+    <button class="btn btn-secondary" onclick={applyCrossingNodeTags}>
+      Apply crossing node tags
     </button>
   </div>
 </div>

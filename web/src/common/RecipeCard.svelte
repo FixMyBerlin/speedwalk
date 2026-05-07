@@ -80,6 +80,10 @@
         $backend!.editApplyMaxspeed();
         recipeSteps.update((s) => [...s, step]);
         break;
+      case "applyCrossingNodeTags":
+        $backend!.editApplyCrossingNodeTags();
+        recipeSteps.update((s) => [...s, step]);
+        break;
       case "setNetworkFilter":
         networkFilter.set({
           include: step.include,

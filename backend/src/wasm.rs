@@ -322,6 +322,15 @@ impl Speedwalk {
         Ok(())
     }
 
+    #[wasm_bindgen(js_name = editApplyCrossingNodeTags)]
+    pub fn edit_apply_crossing_node_tags(&mut self) -> Result<(), JsValue> {
+        let mut edits = self.edits.take().unwrap();
+        let _ = edits.apply_cmd(UserCmd::ApplyCrossingNodeTags, self);
+        self.edits = Some(edits);
+        self.after_edit();
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = editSetTags)]
     pub fn edit_set_tags(
         &mut self,
